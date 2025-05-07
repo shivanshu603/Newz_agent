@@ -37,6 +37,31 @@ from utils.memory_manager import MemoryManager
 import nltk
 import gc
 
+# Monkey patch torch.multinomial to handle NaN/Inf values
+original_multinomial = torch.multinomial
+
+def safe_multinomial(input, num_samples, *args, **kwargs):
+    """
+    A safer version of torch.multinomial that handles NaN/Inf values.
+    """
+    # Check for NaN or Inf values
+    if torch.isnan(input).any() or torch.isinf(input).any():
+        logger.warning("NaN/Inf detected in multinomial input, applying fix")
+        # Replace NaN/Inf with zeros
+        input = torch.where(torch.isnan(input) | torch.isinf(input), torch.zeros_like(input), input)
+        # Ensure all values are positive
+        input = torch.where(input < 0, torch.zeros_like(input), input)
+        # If a row sums to 0, set the first element to 1
+        row_sums = input.sum(dim=1, keepdim=True)
+        zero_rows = (row_sums == 0).expand_as(input)
+        input = torch.where(zero_rows, torch.zeros_like(input), input)
+        input[:, 0] = torch.where(row_sums.squeeze(1) == 0, torch.ones_like(input[:, 0]), input[:, 0])
+    
+    return original_multinomial(input, num_samples, *args, **kwargs)
+
+# Apply the monkey patch
+torch.multinomial = safe_multinomial
+
 def initialize_nltk():
     try:
         nltk_data_dir = os.path.join(os.path.dirname(__file__), "nltk_data")
@@ -377,6 +402,25 @@ class BlogGenerator:
         else:
             return f"Learn all about {topic} in this comprehensive article."
 
+    def _fix_probability_tensor(self, tensor):
+        """
+        Fix probability tensor to avoid numerical issues.
+        This function is used to patch the model's forward method to handle NaN/Inf values.
+        """
+        # Replace NaN/Inf with zeros
+        tensor = torch.where(torch.isnan(tensor), torch.zeros_like(tensor), tensor)
+        tensor = torch.where(torch.isinf(tensor), torch.zeros_like(tensor), tensor)
+        
+        # Ensure all values are positive
+        tensor = torch.where(tensor < 0, torch.zeros_like(tensor), tensor)
+        
+        # Ensure tensor sums to 1
+        tensor_sum = tensor.sum(dim=-1, keepdim=True)
+        tensor_sum = torch.where(tensor_sum == 0, torch.ones_like(tensor_sum), tensor_sum)
+        tensor = tensor / tensor_sum
+        
+        return tensor
+
     def _initialize_model(self):
         try:
             self.model_name = "gpt2"
@@ -401,11 +445,23 @@ class BlogGenerator:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
             self.model.config.eos_token_id = self.tokenizer.eos_token_id
             self.model.config.bos_token_id = self.tokenizer.bos_token_id
-            self.model.config.num_beams = 3  # Increased from 2 to 3 for better quality
-            self.model.config.length_penalty = 1.5  # Increased to favor longer sequences
-            self.model.config.no_repeat_ngram_size = 3  # Increased to prevent more repetition
+            
+            # Reduce beam search parameters for stability
+            self.model.config.num_beams = 2  # Reduced from 3 to 2 for stability
+            self.model.config.length_penalty = 1.0  # Reduced from 1.5 to 1.0
+            self.model.config.no_repeat_ngram_size = 2  # Reduced from 3 to 2
             self.model.config.early_stopping = True
+            
+            # Set model to evaluation mode
             self.model.eval()
+            
+            # Set torch to a more numerically stable mode if available
+            if hasattr(torch, 'set_deterministic'):
+                torch.set_deterministic(False)  # Allow non-deterministic algorithms
+            if hasattr(torch, 'backends') and hasattr(torch.backends, 'cudnn'):
+                torch.backends.cudnn.deterministic = False
+                torch.backends.cudnn.benchmark = True
+                
             logger.info(f"Successfully initialized {self.model_name} with stable configuration")
         except Exception as e:
             logger.error(f"Model initialization error: {e}")
@@ -448,23 +504,63 @@ class BlogGenerator:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                # Generate text with attention mask
-                output = self.model.generate(
-                    input_ids,
-                    max_length=min(max_length, 1024),  # Increased from 512 to 1024
-                    num_return_sequences=1,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    do_sample=True,
-                    no_repeat_ngram_size=3,
-                    early_stopping=True,
-                    num_beams=self.model.config.num_beams,
-                    length_penalty=self.model.config.length_penalty,  # Added length_penalty
-                    attention_mask=attention_mask
-                )
+                # Patch the model's forward method to handle numerical instability
+                original_forward = self.model.forward
+                
+                def patched_forward(*args, **kwargs):
+                    outputs = original_forward(*args, **kwargs)
+                    # Fix logits if they contain NaN or Inf values
+                    if hasattr(outputs, 'logits') and outputs.logits is not None:
+                        if torch.isnan(outputs.logits).any() or torch.isinf(outputs.logits).any():
+                            logger.warning("Detected NaN/Inf in logits, applying fix")
+                            # Apply a simple fix: replace NaN/Inf with zeros
+                            outputs.logits = torch.where(
+                                torch.isnan(outputs.logits) | torch.isinf(outputs.logits),
+                                torch.zeros_like(outputs.logits),
+                                outputs.logits
+                            )
+                    return outputs
+                
+                # Apply the patch temporarily
+                self.model.forward = patched_forward
+                
+                try:
+                    # Generate text with attention mask and error handling
+                    try:
+                        output = self.model.generate(
+                            input_ids,
+                            max_length=min(max_length, 1024),
+                            num_return_sequences=1,
+                            pad_token_id=self.tokenizer.eos_token_id,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            repetition_penalty=repetition_penalty,
+                            do_sample=True,
+                            no_repeat_ngram_size=2,  # Reduced from 3 to 2 for stability
+                            early_stopping=True,
+                            num_beams=self.model.config.num_beams,
+                            length_penalty=self.model.config.length_penalty,
+                            attention_mask=attention_mask
+                        )
+                    except RuntimeError as e:
+                        # If beam sampling fails, fall back to greedy decoding
+                        if "probability tensor" in str(e):
+                            logger.warning("Beam sampling failed, falling back to greedy decoding")
+                            output = self.model.generate(
+                                input_ids,
+                                max_length=min(max_length, 1024),
+                                num_return_sequences=1,
+                                pad_token_id=self.tokenizer.eos_token_id,
+                                do_sample=False,  # Disable sampling
+                                num_beams=1,      # Disable beam search
+                                attention_mask=attention_mask
+                            )
+                        else:
+                            raise
+                finally:
+                    # Restore the original forward method
+                    self.model.forward = original_forward
                 
                 # Decode the generated text
                 generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
@@ -679,21 +775,61 @@ class BlogGenerator:
             # Add attention mask to avoid warning
             attention_mask = torch.ones(input_ids.shape, dtype=torch.long)
             
-            output = self.model.generate(
-                input_ids,
-                max_length=min(max_length, 1024),  # Increased from 512 to 1024
-                num_return_sequences=1,
-                pad_token_id=self.tokenizer.eos_token_id,
-                temperature=0.8,  # Increased from 0.7 to 0.8 for more creativity
-                top_k=60,  # Increased from 50 to 60
-                top_p=0.95,  # Increased from 0.92 to 0.95
-                repetition_penalty=1.3,  # Increased from 1.2 to 1.3
-                do_sample=True,
-                num_beams=self.model.config.num_beams,
-                length_penalty=self.model.config.length_penalty,  # Added length_penalty
-                early_stopping=self.model.config.early_stopping,
-                attention_mask=attention_mask
-            )
+            # Patch the model's forward method to handle numerical instability
+            original_forward = self.model.forward
+            
+            def patched_forward(*args, **kwargs):
+                outputs = original_forward(*args, **kwargs)
+                # Fix logits if they contain NaN or Inf values
+                if hasattr(outputs, 'logits') and outputs.logits is not None:
+                    if torch.isnan(outputs.logits).any() or torch.isinf(outputs.logits).any():
+                        logger.warning("Detected NaN/Inf in logits, applying fix")
+                        # Apply a simple fix: replace NaN/Inf with zeros
+                        outputs.logits = torch.where(
+                            torch.isnan(outputs.logits) | torch.isinf(outputs.logits),
+                            torch.zeros_like(outputs.logits),
+                            outputs.logits
+                        )
+                return outputs
+            
+            # Apply the patch temporarily
+            self.model.forward = patched_forward
+            
+            try:
+                # Use safer generation parameters
+                output = self.model.generate(
+                    input_ids,
+                    max_length=min(max_length, 1024),
+                    num_return_sequences=1,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    temperature=0.7,  # Reduced for stability
+                    top_k=50,
+                    top_p=0.92,
+                    repetition_penalty=1.2,
+                    do_sample=True,
+                    num_beams=self.model.config.num_beams,
+                    length_penalty=self.model.config.length_penalty,
+                    early_stopping=self.model.config.early_stopping,
+                    attention_mask=attention_mask
+                )
+            except RuntimeError as e:
+                # If beam sampling fails, try greedy decoding
+                if "probability tensor" in str(e):
+                    logger.warning("Beam sampling failed, falling back to greedy decoding")
+                    output = self.model.generate(
+                        input_ids,
+                        max_length=min(max_length, 1024),
+                        num_return_sequences=1,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        do_sample=False,  # Disable sampling
+                        num_beams=1,      # Disable beam search
+                        attention_mask=attention_mask
+                    )
+                else:
+                    raise
+            finally:
+                # Restore the original forward method
+                self.model.forward = original_forward
             generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
             word_count = len(generated_text.split())
             preview = generated_text[:200] + "..." if len(generated_text) > 200 else generated_text
