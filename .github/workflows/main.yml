@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: manual workflow
 
 on:
   workflow_dispatch:      # manual trigger
