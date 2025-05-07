@@ -29,5 +29,5 @@ jobs:
           pip install -r ai_agent/requirements.txt
           python -m spacy download en_core_web_sm
 
-      - name: Run continuous operation
-        run: python ai_agent/continuous_operation.py
+      - name: Run blog_generator_new.py
+        run: python ai_agent/blog_generator_new.py
